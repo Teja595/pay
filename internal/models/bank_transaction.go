@@ -10,7 +10,7 @@ import (
 type BankTransaction struct {
 	ID               uuid.UUID `gorm:"type:uuid;primaryKey"`
 	UploadBatchID    uuid.UUID `gorm:"index"`
-	TransactionDate  time.Time
+	TransactionDate  time.Time `gorm:"column:transaction_date"`
 	Description      string
 	Amount           float64 `gorm:"index"`
 	ReferenceNumber  string
