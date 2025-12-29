@@ -302,6 +302,10 @@ func (h *ReconciliationHandler) UploadInvoices(c *gin.Context) {
 		)
 
 		h.service.CreateInvoice(invoiceNumber, customerName, customerEmail, amount, status, dueDate)
+		// After processing all rows
+		if err := h.service.LoadInvoiceCache(); err != nil {
+			log.Println("ERROR loading invoice cache:", err)
+		}
 		inserted++
 	}
 

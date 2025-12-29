@@ -23,6 +23,24 @@ type ReconciliationService struct {
 	db              *gorm.DB
 	progressCache   sync.Map // batchID -> *Progress
 	statsCache      sync.Map // batchID -> *BatchStats
+	// Invoice cache: amount -> list of invoices
+	invoiceCache map[float64][]*models.Invoice
+}
+
+func (s *ReconciliationService) LoadInvoiceCache() error {
+	invoices, err := s.invoiceRepo.GetAll()
+	if err != nil {
+		return err
+	}
+
+	cache := make(map[float64][]*models.Invoice)
+	for i := range invoices {
+		cache[invoices[i].Amount] = append(cache[invoices[i].Amount], &invoices[i])
+	}
+
+	s.invoiceCache = cache
+	log.Println("Invoice cache loaded, total amounts:", len(cache))
+	return nil
 }
 
 // 2. Compute name similarity scores
@@ -62,11 +80,8 @@ func (s *ReconciliationService) CreateBatch(filename string) *models.Reconciliat
 }
 func (s *ReconciliationService) MatchTransaction(tx *models.BankTransaction) (*models.BankTransaction, error) {
 
-	// 1. Exact amount match (business rule)
-	invoices, err := s.invoiceRepo.FindByAmount(tx.Amount)
-	if err != nil {
-		return nil, err
-	}
+	// 1. Lookup invoices from cache instead of DB
+	invoices := s.invoiceCache[tx.Amount]
 
 	if len(invoices) == 0 {
 		tx.Status = "unmatched"
@@ -89,7 +104,7 @@ func (s *ReconciliationService) MatchTransaction(tx *models.BankTransaction) (*m
 		dateScore := computeDateScore(tx.TransactionDate, inv.DueDate)
 
 		candidates = append(candidates, candidate{
-			invoice:   &inv,
+			invoice:   inv,
 			nameScore: nameScore,
 			dateScore: dateScore,
 		})

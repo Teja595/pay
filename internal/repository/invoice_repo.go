@@ -65,6 +65,11 @@ func (r *InvoiceRepository) SearchInvoices(query string, amount float64, statuse
 	err := dbQuery.Find(&invoices).Error
 	return invoices, err
 }
+func (r *InvoiceRepository) GetAll() ([]models.Invoice, error) {
+	var invoices []models.Invoice
+	err := r.db.Find(&invoices).Error
+	return invoices, err
+}
 
 // invoice_repository.go
 func (r *InvoiceRepository) FindMatchingInvoice(
