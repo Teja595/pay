@@ -3,6 +3,7 @@ package handler
 import (
 	"bufio"
 	"encoding/csv"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -367,9 +368,31 @@ func (h *ReconciliationHandler) processCSV(batchID uuid.UUID, filePath string) {
 
 		// Parse row values
 		amount, _ := strconv.ParseFloat(record[3], 64)
-		// log.Println(record[1])
+		log.Println(record[1])
 		dateStr := strings.TrimSpace(record[1])
-		date, err := time.Parse("02-01-2006", dateStr)
+		var date time.Time
+
+		// List of possible date formats
+		formats := []string{
+			"02-01-2006", // dd-MM-yyyy
+			"2006-01-02", // yyyy-MM-dd
+			"02/01/2006", // dd/MM/yyyy
+			"01/02/2006", // MM/dd/yyyy
+			time.RFC3339, // ISO format
+		}
+
+		for _, format := range formats {
+			date, err = time.Parse(format, dateStr)
+			if err == nil {
+				break // successfully parsed
+			}
+		}
+
+		if err != nil {
+			// handle parse error
+			fmt.Printf("failed to parse date: %s\n", dateStr)
+			return
+		}
 
 		// INSERT transaction into DB
 		tx := h.service.CreateTransaction(batchID, record[2], amount, record[4], date)
