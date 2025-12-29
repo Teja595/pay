@@ -301,7 +301,7 @@ func (s *ReconciliationService) GetBatch(batchID uuid.UUID) (*models.Reconciliat
 	if err := s.db.First(&batch, "id = ?", batchID).Error; err != nil {
 		return nil, err
 	}
-	log.Println("batchhh ", batch)
+	// log.Println("batchhh ", batch)
 	return &batch, nil
 }
 func (s *ReconciliationService) ConfirmTransaction(txID uuid.UUID) (*models.BankTransaction, error) {
@@ -380,6 +380,7 @@ func (s *ReconciliationService) ListTransactions(
 	status string,
 	cursor string,
 	limit int,
+	search string, // <-- new parameter
 ) ([]models.BankTransaction, string, bool) {
 
 	var txs []models.BankTransaction
@@ -388,12 +389,23 @@ func (s *ReconciliationService) ListTransactions(
 		Order("id ASC").
 		Limit(limit + 1)
 
-	if status != "" {
+	// filter by status
+	if status != "" && status != "all" {
 		query = query.Where("status = ?", status)
 	}
 
+	// filter by cursor
 	if cursor != "" {
 		query = query.Where("id > ?", cursor)
+	}
+
+	// filter by search (description or amount)
+	if search != "" {
+		likeQuery := "%" + search + "%"
+		query = query.Where(
+			"description ILIKE ? OR CAST(amount AS TEXT) LIKE ?",
+			likeQuery, likeQuery,
+		)
 	}
 
 	query.Find(&txs)

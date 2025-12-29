@@ -193,9 +193,10 @@ func (h *ReconciliationHandler) ListTransactions(c *gin.Context) {
 
 	status := c.Query("status")
 	cursor := c.Query("cursor")
+	search := c.Query("search") // NEW: search query
 	limit := 50
 
-	items, nextCursor, hasMore := h.service.ListTransactions(batchID, status, cursor, limit)
+	items, nextCursor, hasMore := h.service.ListTransactions(batchID, status, cursor, limit, search)
 	stats, _ := h.service.GetBatchStats(batchID) // ignore error for now
 
 	c.JSON(http.StatusOK, gin.H{
@@ -348,6 +349,7 @@ func (h *ReconciliationHandler) Upload(c *gin.Context) {
 	})
 }
 func (h *ReconciliationHandler) processCSV(batchID uuid.UUID, filePath string) {
+	start := time.Now() // <-- start timer
 	file, _ := os.Open(filePath)
 	defer file.Close()
 	reader := csv.NewReader(bufio.NewReader(file))
@@ -382,6 +384,9 @@ func (h *ReconciliationHandler) processCSV(batchID uuid.UUID, filePath string) {
 	}
 
 	h.service.MarkBatchCompleted(batchID, count)
+	// Log total time
+	elapsed := time.Since(start)
+	log.Printf("Batch %s processed %d transactions in %v", batchID, count, elapsed)
 }
 
 func (h *ReconciliationHandler) processBatch(txs []*models.BankTransaction) {
