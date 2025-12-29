@@ -1,14 +1,18 @@
 package handler
 
 import (
+	"bufio"
 	"encoding/csv"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"payment-reconciliation-backend/internal/models"
 	service "payment-reconciliation-backend/internal/services/reconciliation"
 
 	"github.com/gin-gonic/gin"
@@ -308,8 +312,6 @@ func (h *ReconciliationHandler) UploadInvoices(c *gin.Context) {
 		"invoicesAdded": inserted,
 	})
 }
-
-// Upload handles CSV uploads, creates a batch, and processes in background
 func (h *ReconciliationHandler) Upload(c *gin.Context) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -318,71 +320,70 @@ func (h *ReconciliationHandler) Upload(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Create batch in DB (service generates UUID)
+	// Save file to temp location
+	tempPath := filepath.Join(os.TempDir(), header.Filename)
+
+	out, err := os.Create(tempPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot save file"})
+		return
+	}
+	defer out.Close()
+
+	io.Copy(out, file)
+
+	// Create batch
 	batch := h.service.CreateBatch(header.Filename)
 
-	// Process CSV in background (pass batch.ID as uuid.UUID)
-	go h.processCSV(batch.ID, file)
+	// Process async using file path (SAFE)
+	go h.processCSV(batch.ID, tempPath)
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"batch_id": batch.ID.String(), // send string in JSON
+		"batch_id": batch.ID.String(),
 		"status":   "processing",
 	})
 }
-func (h *ReconciliationHandler) processCSV(batchID uuid.UUID, reader io.Reader) {
-	csvReader := csv.NewReader(reader)
-	csvReader.FieldsPerRecord = -1
-
-	// Skip header
-	_, _ = csvReader.Read()
+func (h *ReconciliationHandler) processCSV(batchID uuid.UUID, filePath string) {
+	file, _ := os.Open(filePath)
+	defer file.Close()
+	reader := csv.NewReader(bufio.NewReader(file))
+	_, _ = reader.Read() // skip header
 
 	count := 0
-
 	for {
-		record, err := csvReader.Read()
+		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			continue // skip malformed rows
-		}
-
-		// Skip completely blank rows
-		if len(record) == 0 || strings.Join(record, "") == "" {
 			continue
 		}
 
-		// Parse amount
-		amount, err := strconv.ParseFloat(record[3], 64)
-		if err != nil {
-			continue // skip if amount invalid
-		}
+		// Parse row values
+		amount, _ := strconv.ParseFloat(record[3], 64)
+		// log.Println(record[1])
+		dateStr := strings.TrimSpace(record[1])
+		date, err := time.Parse("02-01-2006", dateStr)
 
-		// Parse date
-		date, err := time.Parse("02-01-2006", record[1])
-		if err != nil {
-			continue // skip if date invalid
-		}
-
-		// Create transaction
+		// INSERT transaction into DB
 		tx := h.service.CreateTransaction(batchID, record[2], amount, record[4], date)
 
-		// *** Run automatic matching immediately ***
+		// Optional: run matching
 		h.service.MatchTransaction(tx)
 
 		count++
-
-		// Update progress every 100 rows
 		if count%100 == 0 {
 			h.service.UpdateBatchProgress(batchID, count)
 		}
 	}
 
-	// Final batch completion
 	h.service.MarkBatchCompleted(batchID, count)
+}
 
-	// Final batch completion
-	h.service.MarkBatchCompleted(batchID, count)
+func (h *ReconciliationHandler) processBatch(txs []*models.BankTransaction) {
+	for _, tx := range txs {
+		h.service.MatchTransaction(tx)
+	}
 }
 
 type ReconciliationHandler struct {

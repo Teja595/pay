@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"encoding/json"
+	"log"
 	"math"
 	"strings"
 	"time"
@@ -60,7 +61,8 @@ func (s *ReconciliationService) CreateBatch(filename string) *models.Reconciliat
 	return batch
 }
 func (s *ReconciliationService) MatchTransaction(tx *models.BankTransaction) (*models.BankTransaction, error) {
-	// 1. Find invoices with exact amount
+
+	// 1. Exact amount match (business rule)
 	invoices, err := s.invoiceRepo.FindByAmount(tx.Amount)
 	if err != nil {
 		return nil, err
@@ -72,94 +74,134 @@ func (s *ReconciliationService) MatchTransaction(tx *models.BankTransaction) (*m
 		return tx, nil
 	}
 
-	// 2. Compute name similarity scores
 	type candidate struct {
-		invoice *models.Invoice
-		score   float64
+		invoice        *models.Invoice
+		nameScore      float64
+		dateScore      float64
+		ambiguityScore float64
+		finalScore     float64
 	}
+
 	var candidates []candidate
+
 	for _, inv := range invoices {
-		score := computeNameSimilarity(tx.Description, inv.CustomerName)
-		candidates = append(candidates, candidate{invoice: &inv, score: score})
+		nameScore := computeNameSimilarity(tx.Description, inv.CustomerName)
+		dateScore := computeDateScore(tx.TransactionDate, inv.DueDate)
+
+		candidates = append(candidates, candidate{
+			invoice:   &inv,
+			nameScore: nameScore,
+			dateScore: dateScore,
+		})
 	}
 
-	// 3. Consider multiple invoices with same amount
+	// 2. Ambiguity penalty if multiple invoices
+	ambiguityScore := 100.0
 	if len(candidates) > 1 {
-		for i := range candidates {
-			candidates[i].score *= 0.8 // reduce confidence due to ambiguity
-		}
+		ambiguityScore = 80.0
 	}
 
-	// 4. Adjust by date proximity
+	// 3. Final weighted confidence score
 	for i := range candidates {
-		candidates[i].score += dateProximityScore(tx.TransactionDate, candidates[i].invoice.DueDate)
-		if candidates[i].score > 100 {
-			candidates[i].score = 100
-		}
+		candidates[i].ambiguityScore = ambiguityScore
+		candidates[i].finalScore =
+			0.6*candidates[i].nameScore +
+				0.3*candidates[i].dateScore +
+				0.1*candidates[i].ambiguityScore
 	}
 
-	// 5. Pick the best candidate
+	// 4. Pick best candidate
 	best := candidates[0]
 	for _, c := range candidates {
-		if c.score > best.score {
+		if c.finalScore > best.finalScore {
 			best = c
 		}
 	}
 
-	// 6. Categorize
+	// 5. Categorize
 	switch {
-	case best.score >= 95:
+	case best.finalScore >= 90:
 		tx.Status = "auto_matched"
-	case best.score >= 60:
+	case best.finalScore >= 60:
 		tx.Status = "needs_review"
 	default:
 		tx.Status = "unmatched"
 	}
 
 	tx.MatchedInvoiceID = &best.invoice.ID
-	tx.ConfidenceScore = best.score
-	// 7. Save match info
-	tx.MatchedInvoiceID = &best.invoice.ID
-	tx.ConfidenceScore = best.score
+	tx.ConfidenceScore = math.Min(best.finalScore, 100)
 
+	// 6. Persist match details
 	details := map[string]interface{}{
 		"amount_match":     true,
 		"invoice_id":       best.invoice.ID.String(),
 		"invoice_name":     best.invoice.CustomerName,
 		"transaction_desc": tx.Description,
-		"name_similarity":  best.score,
-		"decision":         tx.Status,
+		"name_score":       best.nameScore,
+		"date_score":       best.dateScore,
+		"ambiguity_score":  best.ambiguityScore,
+		"final_score":      best.finalScore,
 		"candidate_count":  len(candidates),
+		"decision":         tx.Status,
 	}
 
 	detailsJSON, _ := json.Marshal(details)
 	tx.MatchDetails = detailsJSON
+
 	s.db.Save(tx)
 	return tx, nil
 }
 
 // Use Levenshtein or Jaro-Winkler (implement simple version or use a library)
 func computeNameSimilarity(bankDesc, invoiceName string) float64 {
-	b := normalizeName(bankDesc)
-	i := normalizeName(invoiceName)
-	// placeholder: simple ratio of common words
-	wordsB := strings.Fields(b)
-	wordsI := strings.Fields(i)
-	matches := 0
-	for _, w1 := range wordsB {
-		for _, w2 := range wordsI {
-			if w1 == w2 {
-				matches++
+	bTokens := strings.Fields(normalizeName(bankDesc))
+	iTokens := strings.Fields(normalizeName(invoiceName))
+
+	if len(iTokens) == 0 {
+		return 0
+	}
+
+	totalScore := 0.0
+
+	for _, invTok := range iTokens {
+		best := 0.0
+		for _, bankTok := range bTokens {
+			dist := levenshtein(invTok, bankTok)
+			maxLen := math.Max(float64(len(invTok)), float64(len(bankTok)))
+			sim := 1 - float64(dist)/maxLen
+			if sim > best {
+				best = sim
 			}
 		}
+		totalScore += best
 	}
-	return float64(matches) / math.Max(float64(len(wordsI)), 1) * 100
+
+	return (totalScore / float64(len(iTokens))) * 100
 }
-func normalizeName(name string) string {
-	n := strings.ToUpper(name)
-	n = strings.ReplaceAll(n, ".", "")
-	n = strings.ReplaceAll(n, ",", "")
-	return n
+
+func normalizeName(s string) string {
+	s = strings.ToUpper(s)
+	s = strings.ReplaceAll(s, ".", "")
+	s = strings.ReplaceAll(s, ",", "")
+	s = strings.ReplaceAll(s, "-", " ")
+	s = strings.TrimSpace(s)
+	return s
+}
+func computeDateScore(txDate, dueDate time.Time) float64 {
+	days := math.Abs(txDate.Sub(dueDate).Hours() / 24)
+
+	switch {
+	case days <= 3:
+		return 100
+	case days <= 7:
+		return 80
+	case days <= 15:
+		return 60
+	case days <= 30:
+		return 40
+	default:
+		return 20
+	}
 }
 
 func dateProximityScore(txDate, dueDate time.Time) float64 {
@@ -171,6 +213,55 @@ func dateProximityScore(txDate, dueDate time.Time) float64 {
 		return -10
 	}
 	return 0
+}
+
+func levenshtein(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+
+	dp := make([][]int, len(a)+1)
+	for i := range dp {
+		dp[i] = make([]int, len(b)+1)
+	}
+
+	for i := 0; i <= len(a); i++ {
+		dp[i][0] = i
+	}
+	for j := 0; j <= len(b); j++ {
+		dp[0][j] = j
+	}
+
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			dp[i][j] = min(
+				dp[i-1][j]+1,
+				dp[i][j-1]+1,
+				dp[i-1][j-1]+cost,
+			)
+		}
+	}
+	return dp[len(a)][len(b)]
+}
+
+func min(a, b, c int) int {
+	if a < b && a < c {
+		return a
+	}
+	if b < c {
+		return b
+	}
+	return c
 }
 
 // CreateTransaction inserts a single BankTransaction row
@@ -195,6 +286,7 @@ func (s *ReconciliationService) GetBatch(batchID uuid.UUID) (*models.Reconciliat
 	if err := s.db.First(&batch, "id = ?", batchID).Error; err != nil {
 		return nil, err
 	}
+	log.Println("batchhh ", batch)
 	return &batch, nil
 }
 func (s *ReconciliationService) ConfirmTransaction(txID uuid.UUID) (*models.BankTransaction, error) {
@@ -406,22 +498,23 @@ func (s *ReconciliationService) GetBatchStatsCache(batchID uuid.UUID) BatchStats
 }
 
 // UpdateBatchProgress updates the processed count in a batch
-func (s *ReconciliationService) UpdateBatchProgress(batchID uuid.UUID, count int) {
-	s.db.Model(&models.ReconciliationBatch{}).
-		Where("id = ?", batchID).
-		Update("processed_count", count)
+func (s *ReconciliationService) UpdateBatchProgress(id uuid.UUID, count int) error {
+	return s.db.Model(&models.ReconciliationBatch{}).
+		Where("id = ?", id).
+		Update("processed_count", count).
+		Error
 }
 
 // MarkBatchCompleted sets batch status to completed
-func (s *ReconciliationService) MarkBatchCompleted(batchID uuid.UUID, total int) {
-	s.db.Model(&models.ReconciliationBatch{}).
+func (s *ReconciliationService) MarkBatchCompleted(batchID uuid.UUID, count int) error {
+	return s.db.Model(&models.ReconciliationBatch{}).
 		Where("id = ?", batchID).
 		Updates(map[string]interface{}{
+			"processed_count":    count,
+			"total_transactions": count, // ✅ FIXED
 			"status":             "completed",
-			"processed_count":    total,
-			"total_transactions": total, // <-- add this line
 			"completed_at":       time.Now(),
-		})
+		}).Error
 }
 
 func (s *ReconciliationService) InvoiceRepo() *repository.InvoiceRepository {
